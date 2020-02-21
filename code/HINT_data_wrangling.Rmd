@@ -1,0 +1,248 @@
+---
+title: "HINT Data Wrangling"
+output: html_notebook
+---
+
+```{r}
+library(tidyverse)
+library(magrittr)
+```
+
+The data supplied by the protein atlas is a little too tidy. Each row is a single protein expression level in a single tissue type. Hence there are number_tissue * number_protein rows. I want each column to be a tissue/cell type and each row to be a protein.
+
+```{r}
+raw_healthy_tissue_data <- read_csv('../raw_data/healthy_tissue_v16.csv')
+raw_healthy_tissue_data <- unite(raw_healthy_tissue_data, col = tissue_type, tissue, cell.type, sep = ".", remove = TRUE)
+
+raw_healthy_tissue_data$tissue_type %<>% str_replace_all(" ", ".")
+raw_healthy_tissue_data$tissue_type %<>% str_replace_all(",", ".")
+raw_healthy_tissue_data$level %<>% str_replace("Not detected", "0")
+raw_healthy_tissue_data$level %<>% str_replace("High", "3")
+raw_healthy_tissue_data$level %<>% str_replace("Medium", "2")
+raw_healthy_tissue_data$level %<>% str_replace("Low", "1")
+raw_healthy_tissue_data %<>% mutate(level = level %>% as.integer)
+healthy_tissue_data <- spread(raw_healthy_tissue_data, tissue_type, level)
+write_csv(healthy_tissue_data, '../raw_data/healthy_tissues_metadata.csv')
+```
+
+Now we'll import the cancer data and put it in a similar data format.
+```{r}
+raw_cancer_data <- read_csv('../raw_data/cancer_v16.csv')
+
+raw_cancer_data$Level %<>% str_replace("Not detected", "0")
+raw_cancer_data$Level %<>% str_replace("High", "3")
+raw_cancer_data$Level %<>% str_replace("Medium", "2")
+raw_cancer_data$Level %<>% str_replace("Low", "1")
+raw_cancer_data %<>% transmute(gene = Gene, gene.name = `Gene name`, tumor = Tumor, level = Level %>% as.integer, count = `Count patients`, total = `Total patients`)
+```
+
+We want to make each protein the average expression level of the samples
+```{r}
+raw_cancer_data %<>% mutate(expression_level = level * count / total, count = NULL, total = NULL)
+raw_cancer_data %<>% spread(level, expression_level)
+cancer_data <- raw_cancer_data %>% transmute(gene, gene.name, tumor, expression_level = `0` + `1` + `2` + `3`)
+cancer_data$tumor %<>% str_replace_all(" ", "_")
+cancer_data %<>% spread(tumor, expression_level)
+cancer_data %>% write_csv('../raw_data/cancer_tissues_metadata.csv')
+```
+
+Get all unique ENSEMBL IDs from helthy and cancer datasets
+```{r}
+all_ensembl_ids <- c(cancer_data$gene, healthy_tissue_data$gene)
+unique_ensembl_ids <- all_ensembl_ids %>% unique
+unique_ensembl_ids %>% as.data.frame %>% write_delim("../raw_data/ensembl_ids.txt")
+```
+
+Now we import the HINT interactome data
+```{r}
+hint_raw_list <- read_tsv("../raw_data/HomoSapiens_binary_hq_downloaded_2019_04_13.txt")
+```
+The HINT intereactome has Uniprot IDs, Gene symbols, and some HGNC IDs. But the protein atlas dataset has only ensembl ids. 
+
+I took the ensembl IDs from the healthy + cancer protein atlas data and then put it into biomart on hgnc's website april 2019, and had it output ensembl ID, hgnc ID, and uniprot ID. Let's load this file in, and see how many have multi-mapping problems
+```{r}
+ensembl_mapping_list <- read_tsv("../raw_data/HGNC_ensembl_names_from_atlas_as_input.txt")
+
+are_duplicated_ensembl_IDs_from_first <- ensembl_mapping_list$`Ensembl gene ID` %>% duplicated() %>% which
+are_duplicated_ensembl_IDs_from_last <- ensembl_mapping_list$`Ensembl gene ID` %>% duplicated(fromLast = TRUE) %>% which
+are_duplicated_ensembl_IDs <- c(are_duplicated_ensembl_IDs_from_first, are_duplicated_ensembl_IDs_from_last) %>% sort
+ensembl_mapping_list[are_duplicated_ensembl_IDs,]
+
+are_duplicated_uniprot_IDs_from_first <- ensembl_mapping_list$`UniProt accession`%>% duplicated() %>% which
+are_duplicated_uniprot_IDs_from_last <- ensembl_mapping_list$`UniProt accession` %>% duplicated(fromLast = TRUE) %>% which
+are_duplicated_uniprot_IDs <- c(are_duplicated_uniprot_IDs_from_first, are_duplicated_uniprot_IDs_from_last) %>% sort
+ensembl_mapping_list[are_duplicated_uniprot_IDs,]
+```
+
+We'll create a list of the unique proteins in the the HINT dataset
+```{r}
+unique_hint_proteins <- tibble(uniprot = c(hint_raw_list$Uniprot_A, hint_raw_list$Uniprot_B), gene = c(hint_raw_list$Gene_A, hint_raw_list$Gene_B), alias = c(hint_raw_list$Alias_A, hint_raw_list$Alias_B)) %>% unique
+unique_hint_proteins %>% dim
+```
+
+```{r}
+colnames(ensembl_mapping_list)[c(2,4,5)] <- c("gene", "ensembl_id", "uniprot")
+protein_atlas_in_hint_uniprot <- semi_join(ensembl_mapping_list, unique_hint_proteins, by = "uniprot") 
+protein_atlas_no_uniprot_match<- anti_join(ensembl_mapping_list, unique_hint_proteins, by = "uniprot")
+protein_atlas_no_uni_match_no_uni_key <- protein_atlas_no_uniprot_match$uniprot %>% is.na %>% which %>% protein_atlas_no_uniprot_match[.,]
+
+#let's see if we can map those without a uniprot key can match by gene name instead.
+gene_name_matched<- protein_atlas_no_uni_match_no_uni_key$gene %in% unique_hint_proteins$gene %>% which %>% protein_atlas_no_uni_match_no_uni_key[.,]
+index_in_hint_list <- gene_name_matched$gene %>% match(., unique_hint_proteins$gene)
+gene_name_matched %<>% mutate(uniprot = unique_hint_proteins$uniprot[index_in_hint_list])
+
+protein_atlas_in_hint <- bind_rows(protein_atlas_in_hint_uniprot, gene_name_matched)
+```
+So we have 9851 proteins in the human protein altas (cancer and healthy) that map to a node in the hint interactome.
+
+We get rid of any gene without network information, because we can't use them for in the denoising procedure.
+Now, we want to see how many times each uniprot id appears in the protein atlas mapping.
+```{r}
+uniprot_mapping_frequency <- array(data = 0, dim = dim(unique_hint_proteins)[1])
+for(ii in 1:dim(unique_hint_proteins)[1]){
+  current_uniprot_id <- unique_hint_proteins$uniprot[ii]
+  #find where it occurs in the ensembl to uniprot map
+  index_mapping <- str_which(protein_atlas_in_hint$uniprot, current_uniprot_id)
+  number_mappings <- length(index_mapping)
+  if(is_empty(number_mappings) != TRUE){
+    uniprot_mapping_frequency[ii] = number_mappings
+  }
+}
+table(uniprot_mapping_frequency)
+sum(uniprot_mapping_frequency > 1)
+```
+
+There are several uniprot genes that have multiple incoming arrows from ensembl IDs in the human protein atlas. There are 3074 nodes that have no data in the protein atlas, and 30 nodes who have multiple mapping genes. Let's look at those that map multiple times and decide how to handle them.
+```{r}
+multiple_ensembl_matches <- which(uniprot_mapping_frequency>1)
+multiple_ensembl_map_indices <- array(dim = 0)
+for(ii in multiple_ensembl_matches){
+  current_uniprot_id <- unique_hint_proteins$uniprot[ii]
+  #find where it occurs in the ensembl to uniprot map
+  ensembl_indices <- str_which(protein_atlas_in_hint$uniprot, current_uniprot_id) 
+  multiple_ensembl_map_indices %<>% append(., ensembl_indices)
+}
+
+protein_atlas_in_hint[multiple_ensembl_map_indices,]
+```
+
+Looks like it is mostly different types/isoforms of the same gene. Many of the multi mapping proteins are histones. If a node in the network has mutiple genes, we will average those genes per cancer, and map it to the single uniprot ID.
+```{r}
+sorted_ensembl_mapping_list_in_network <- protein_atlas_in_hint %>% arrange(uniprot)
+sorted_unique_hint_proteins <- unique_hint_proteins %>% arrange(uniprot)
+combined_map <- right_join(sorted_unique_hint_proteins,
+                           sorted_ensembl_mapping_list_in_network, by = "uniprot")
+combined_map <- combined_map[,-c(4,6)]
+unique_combined_uniprot <- combined_map$uniprot %>% unique
+
+uniprot_int_ids <- as.list(0:(length(unique_combined_uniprot)-1))
+names(uniprot_int_ids) <- unique_combined_uniprot
+
+removed_nodes <- base::setdiff(unique_hint_proteins$uniprot, unique_combined_uniprot)
+
+uniprot_int_ids %<>% c(.,length(unique_combined_uniprot):(length(unique_combined_uniprot)+length(removed_nodes)-1))
+names(uniprot_int_ids)[(length(unique_combined_uniprot)+1):(length(uniprot_int_ids))] <- removed_nodes
+
+int_id <- uniprot_int_ids[combined_map$uniprot] %>% unlist(use.names = FALSE)
+combined_map %<>% bind_cols(int_id = int_id, .)
+combined_map %>% write_csv("../data/id_uniprot_ensembl_map.csv")
+```
+
+```{r}
+all_nodes_in_network_map <- uniprot_int_ids[sorted_unique_hint_proteins$uniprot] %>% unlist(use.names = FALSE)
+all_nodes_in_network_map %<>% bind_cols(int_id = ., uniprot = sorted_unique_hint_proteins$uniprot, name = sorted_unique_hint_proteins$gene)
+all_nodes_in_network_map %<>% arrange(int_id)
+```
+
+
+Let's create a new simplified edge list
+```{r}
+nodes_a_int <- uniprot_int_ids[hint_raw_list$Uniprot_A] %>% unlist # any gene that doesn't have protein expression information gets an NA here and the next line
+nodes_b_int <- uniprot_int_ids[hint_raw_list$Uniprot_B] %>% unlist
+output_edge_list <- tibble(node_a = nodes_a_int, node_b = nodes_b_int)
+output_edge_list %<>% filter(node_a != node_b) #remove self edges
+output_edge_list %<>% arrange(node_a)
+output_edge_list %>% write_csv("../raw_data/edge_list.csv")
+dim(output_edge_list)
+```
+
+Now lets get the cancer protein expression data in the correct order, then average rows together that have the same uniprot id
+```{r}
+colnames(combined_map)[6] <- "ensembl_id"
+colnames(cancer_data)[1] <- "ensembl_id"
+cancer_data_uniprot <- full_join(combined_map, cancer_data, by = "ensembl_id")
+cancer_data_uniprot %<>% filter(is.na(uniprot) == FALSE)
+cancer_data_uniprot %<>% arrange(int_id)
+
+grouped_cancer_data_uniprot <- cancer_data_uniprot %>% group_by(int_id)
+grouped_cancer_data_uniprot %<>% summarise_at(.vars =vars(colnames(cancer_data)[3:22]), mean, na.rm = TRUE)
+
+# impute missing data with randomly sampled from the other cancers 
+missing_cancers <- grouped_cancer_data_uniprot %>% is.na %>% rowSums
+missing_cancers %>% table
+# only missing one cancer for one proteins -- pretty good!
+impute_these_proteins <- which((missing_cancers>0) & (missing_cancers<20))
+missing_column <- grouped_cancer_data_uniprot[impute_these_proteins,] %>% is.na %>% which
+cancers_with_data = c(0:20) # zero is there to make the indexing easier, next row gets rid of zero since it is the protein id and not a cancer expression value
+cancers_with_data <- cancers_with_data[-c(1, missing_column)] %>% tibble
+impute_from_this_cancer <- sample_n(cancers_with_data, length(missing_column))+1 %>% unlist %>% as.integer()
+
+grouped_cancer_data_uniprot[impute_these_proteins, missing_column] <- grouped_cancer_data_uniprot[impute_these_proteins,impute_from_this_cancer[[1:length(impute_from_this_cancer)]]]
+                                 
+grouped_cancer_data_uniprot %>% write_csv("../data/msbm_cancer_data_2019.csv")
+grouped_cancer_data_uniprot %>% is.na %>% rowSums %>% table
+```
+
+```{r}
+colnames(healthy_tissue_data)[1] <- "ensembl_id"
+healthy_data_uniprot <- full_join(combined_map, healthy_tissue_data, by = "ensembl_id")
+healthy_data_uniprot %<>% filter(is.na(uniprot) == FALSE)
+healthy_data_uniprot %<>% arrange(int_id)
+healthy_data_uniprot <- healthy_data_uniprot[-c(5, 7, 8)]
+grouped_healthy_data_uniprot <- healthy_data_uniprot %>% group_by(int_id)
+grouped_healthy_data_uniprot %<>% summarise_at(.vars =vars(colnames(healthy_tissue_data)[4:113]), mean, na.rm = TRUE)
+
+healthy_tissue_average_data <- grouped_healthy_data_uniprot %>%
+  rowwise %>%
+  transmute(int_id, breast = mean(c(breast.adipocytes, breast.glandular.cells), na.rm = TRUE), 
+            glia = mean(c(cerebral.cortex.glial.cells, hippocampus.glial.cells, caudate.glial.cells), na.rm = TRUE), 
+            cervix = mean(c(cervix..uterine.glandular.cells, cervix..uterine.squamous.epithelial.cells), na.rm = TRUE),
+            colorectal = mean(c(colon.endothelial.cells, colon.glandular.cells, rectum.glandular.cells), na.rm = TRUE),
+            endometrium = mean(c(endometrium.1.cells.in.endometrial.stroma, endometrium.1.glandular.cells, endometrium.2.cells.in.endometrial.stroma, endometrium.2.glandular.cells), na.rm = TRUE),
+            testes = mean(c(epididymis.glandular.cells, seminal.vesicle.glandular.cells, testis.cells.in.seminiferous.ducts, testis.Leydig.cells), na.rm = TRUE),
+            thyroid = thyroid.gland.glandular.cells,
+            kidney = mean(c(kidney.cells.in.glomeruli, kidney.cells.in.tubules), na.rm = TRUE),
+            liver = mean(c(liver.bile.duct.cells, liver.hepatocytes), na.rm = TRUE),
+            lung = lung.pneumocytes,
+            lymph = mean(c(lymph.node.germinal.center.cells, `lymph.node.non-germinal.center.cells`), na.rm = TRUE),
+            pancreas = mean(c(pancreas.exocrine.glandular.cells, pancreas.islets.of.Langerhans), na.rm = TRUE),
+            prostate = prostate.glandular.cells,
+            skin = mean(c(skin.1.fibroblasts, skin.1.keratinocytes, skin.2.epidermal.cells), na.rm = TRUE),
+            melanocyte = skin.1.melanocytes,
+            stomach = mean(c(stomach.1.glandular.cells, stomach.2.glandular.cells), na.rm = TRUE),
+            urinary = urinary.bladder.urothelial.cells,
+            head.and.neck = mean(c(nasopharynx.respiratory.epithelial.cells, oral.mucosa.squamous.epithelial.celltkls, salivary.gland.glandular.cells), na.rm = TRUE),
+            ovary = ovary.ovarian.stroma.cells,
+            norm.carcinoid = mean(c(colon.endothelial.cells, colon.glandular.cells, `colon.peripheral.nerve/ganglion`, duodenum.glandular.cells, pancreas.exocrine.glandular.cells, pancreas.islets.of.Langerhans, prostate.glandular.cells), na.rm = TRUE)
+            )
+missing_healthy <- healthy_tissue_average_data %>% is.na %>% rowSums
+missing_healthy %>% table
+```
+There are 717 proteins that have network information but no gene expression information. There are 277 proteins that have expression data for all except one healthy tissues. 6 proteins have expression data for all but 2 healthy tissues. For those missing data, we will impute data using the expression values of that protein in other healthy tissues 
+
+```{r}
+# impute missing data with randomly sampled from the other healthy tissues 
+impute_these_tissues <- which((missing_healthy>0) & (missing_healthy<20))
+for(ii in impute_these_tissues){
+  missing_column <- healthy_tissue_average_data[ii,] %>% is.na %>% which
+  healthy_with_data = c(0:20) # zero is there to make the indexing easier, next row gets rid of zero since it is the protein id and not an expression value
+  healthy_with_data <- healthy_with_data[-c(1, missing_column)] %>% tibble
+  impute_from_this_healthy <- sample_n(healthy_with_data, length(missing_column))+1 %>% unlist %>% as.integer()
+
+  healthy_tissue_average_data[ii, missing_column] <- healthy_tissue_average_data[ii,impute_from_this_healthy[[1:length(impute_from_this_healthy)]]]
+
+}
+
+healthy_tissue_average_data %>% write_csv("../data/msbm_healthy_data_2019.csv")
+```
+
